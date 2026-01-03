@@ -1,0 +1,16 @@
+[package]
+name = "qonos"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sonos-websocket = { path = "../sonos-websocket" }
+tokio = { version = "1", features = ["full"] }
+qonductor = { path = "../qonductor" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
