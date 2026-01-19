@@ -1161,6 +1161,7 @@ dependencies = [
 name = "qonos"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "qonductor",
  "reqwest",
  "serde",
@@ -1168,6 +1169,7 @@ dependencies = [
  "sonos-websocket",
  "thiserror 2.0.17",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

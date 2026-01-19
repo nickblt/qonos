@@ -2,4 +2,4 @@
 //!
 //! Re-exports types from sonos-websocket and provides bridge helpers.
 
-pub use sonos_websocket::{GroupId, PlayState, Player, PlayerId, SonosSystem, SystemEvent};
+pub use sonos_websocket::{GroupId, PlayState, Player, PlayerEvent, PlayerId, SonosSystem, SystemEvent};
