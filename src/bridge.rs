@@ -862,6 +862,133 @@ impl SonosBridge {
                         }
                     }
 
+                    Notification::QueueLoadTracks(msg) => {
+                        let version = msg.queue_version.as_ref();
+                        let major = version.and_then(|v| v.major).unwrap_or(0);
+                        let minor = version.and_then(|v| v.minor).unwrap_or(0);
+                        let position = msg.queue_position.unwrap_or(0) as usize;
+                        info!(
+                            "[{}] Queue load tracks: {} tracks, position {} (version {}.{})",
+                            name, msg.tracks.len(), position, major, minor
+                        );
+
+                        let Some(sn) = service_account_number else {
+                            warn!("[{}] Cannot load tracks: no service account number yet", name);
+                            continue;
+                        };
+
+                        // Update the queue store (same as QueueState)
+                        let track_tuples: Vec<(u64, u64)> = msg.tracks
+                            .iter()
+                            .filter_map(|t| Some((t.track_id? as u64, t.queue_item_id)))
+                            .collect();
+
+                        let queue_state = QueueState::from_tracks(
+                            &track_tuples,
+                            (major, minor),
+                            sn,
+                            qobuz_client.clone(),
+                        );
+                        queue_store.update(&bridge_id, queue_state).await;
+
+                        // Determine the target track from queue_position
+                        let target = msg.tracks.get(position).or_else(|| msg.tracks.first());
+                        let Some(target) = target else {
+                            warn!("[{}] QueueLoadTracks with empty track list", name);
+                            continue;
+                        };
+
+                        let target_queue_item_id = target.queue_item_id;
+                        let target_track_id = target.track_id.unwrap_or(0) as u64;
+
+                        // Update current track state
+                        current_queue_item_id = Some(target_queue_item_id as i32);
+                        current_track_id = Some(target_track_id);
+
+                        // Fetch duration for the target track
+                        if let Some(client) = &qobuz_client {
+                            match client.get_tracks(&[target_track_id]).await {
+                                Ok(metadata) if !metadata.is_empty() => {
+                                    current_duration_ms = Some(metadata[0].duration_secs * 1000);
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if let Some(sid) = &session_id {
+                            // Active session — reload cloud queue at the target track
+                            let queue_url = format!(
+                                "{}/queues/{}/v2.3/",
+                                cloud_queue_config.base_url, bridge_id
+                            );
+                            let start_item_id = target_queue_item_id.to_string();
+
+                            // Fetch metadata for the target track
+                            let track_metadata = if let Some(client) = &qobuz_client {
+                                match client.get_tracks(&[target_track_id]).await {
+                                    Ok(metadata) if !metadata.is_empty() => {
+                                        let m = &metadata[0];
+                                        Some(Track {
+                                            name: Some(m.title.clone()),
+                                            artist: Some(Artist {
+                                                name: m.artist_name.clone(),
+                                                id: None,
+                                            }),
+                                            album: Some(sonos_websocket::Album {
+                                                name: m.album_title.clone(),
+                                                artist: None,
+                                                id: None,
+                                            }),
+                                            duration_millis: Some((m.duration_secs * 1000) as i32),
+                                            image_url: m.album_image_url.clone(),
+                                            id: Some(MusicObjectId {
+                                                object_id: format!("track:{}", target_track_id),
+                                                service_id: Some("31".to_string()),
+                                                account_id: Some(format!("sn_{}", sn)),
+                                            }),
+                                            ..Default::default()
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+
+                            match player
+                                .load_cloud_queue(
+                                    sid,
+                                    LoadCloudQueueRequest {
+                                        queue_base_url: queue_url,
+                                        item_id: Some(start_item_id.clone()),
+                                        play_on_completion: Some(true),
+                                        track_metadata,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    info!(
+                                        "[{}] Loaded cloud queue at item {} (track {})",
+                                        name, start_item_id, target_track_id
+                                    );
+                                    commanded = Some(CommandedState::new(PlayingState::Playing, None));
+                                }
+                                Err(e) => {
+                                    warn!("[{}] Failed to load cloud queue: {}", name, e);
+                                }
+                            }
+                        } else {
+                            // No session yet — store as pending so initial load picks it up
+                            info!(
+                                "[{}] No active session, storing target track as pending",
+                                name
+                            );
+                            pending_initial_item = Some((target_queue_item_id, 0));
+                        }
+                    }
+
                     Notification::LoopModeSet(msg) => {
                         info!("[{}] Loop mode changed: {:?}", name, msg.mode);
                         // TODO: Sync to Sonos play modes
