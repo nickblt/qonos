@@ -15,6 +15,7 @@ use sonos_websocket::{
     Artist, CreateSessionRequest, LoadCloudQueueRequest, MusicObjectId, Track,
 };
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 // ============================================================================
@@ -56,6 +57,52 @@ async fn find_queue_item_id(queue_store: &QueueStore, bridge_id: &str, track_id:
         .and_then(|item| item.id.parse::<i32>().ok())
 }
 
+/// Map Sonos PlayState to Qobuz PlayingState.
+fn map_sonos_state(state: PlayState) -> PlayingState {
+    match state {
+        PlayState::Playing => PlayingState::Playing,
+        PlayState::Paused => PlayingState::Paused,
+        PlayState::Idle | PlayState::Buffering => PlayingState::Stopped,
+    }
+}
+
+/// Safety timeout for commanded state override.
+const COMMANDED_STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Minimum age before we'll clear a commanded override on state match.
+/// Prevents stale events from the old track clearing the override prematurely.
+const COMMANDED_MIN_AGE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Tracks what we commanded Sonos to do, so we can report the target state
+/// to Qobuz until Sonos confirms it caught up. This prevents transient states
+/// (Idle, Buffering) from causing UI flicker.
+struct CommandedState {
+    state: PlayingState,
+    position_ms: Option<u32>,
+    set_at: Instant,
+}
+
+impl CommandedState {
+    fn new(state: PlayingState, position_ms: Option<u32>) -> Self {
+        Self {
+            state,
+            position_ms,
+            set_at: Instant::now(),
+        }
+    }
+
+    /// Whether this commanded state has expired.
+    fn is_expired(&self) -> bool {
+        self.set_at.elapsed() > COMMANDED_STATE_TIMEOUT
+    }
+
+    /// Whether this override is old enough that a matching state is a real
+    /// confirmation, not a stale event from before the command.
+    fn is_confirmable(&self) -> bool {
+        self.set_at.elapsed() >= COMMANDED_MIN_AGE
+    }
+}
+
 // ============================================================================
 // Bridge Types
 // ============================================================================
@@ -65,6 +112,18 @@ async fn find_queue_item_id(queue_store: &QueueStore, bridge_id: &str, track_id:
 pub struct CloudQueueConfig {
     /// The base URL for the cloud queue server (e.g., "http://192.168.1.100:9443")
     pub base_url: String,
+}
+
+/// All context needed by the event loop, bundled to avoid too many arguments.
+struct EventLoopContext {
+    name: String,
+    player: Player,
+    group_id: GroupId,
+    bridge_id: String,
+    session: DeviceSession,
+    app_id: String,
+    queue_store: QueueStore,
+    cloud_queue_config: CloudQueueConfig,
 }
 
 /// A bridge between a Sonos player/group and a Qobuz Connect device session.
@@ -119,16 +178,17 @@ impl SonosBridge {
         }
 
         // Spawn event loop task
-        let task = tokio::spawn(Self::run_event_loop(
+        let ctx = EventLoopContext {
             name,
             player,
-            group_id.clone(),
-            bridge_id.clone(),
+            group_id: group_id.clone(),
+            bridge_id: bridge_id.clone(),
             session,
             app_id,
             queue_store,
             cloud_queue_config,
-        ));
+        };
+        let task = tokio::spawn(Self::run_event_loop(ctx));
 
         Ok(Self {
             device_uuid,
@@ -137,16 +197,17 @@ impl SonosBridge {
     }
 
     /// Run the event loop, translating between Qobuz and Sonos.
-    async fn run_event_loop(
-        name: String,
-        player: Player,
-        group_id: GroupId,
-        bridge_id: String,
-        mut session: DeviceSession,
-        app_id: String,
-        queue_store: QueueStore,
-        cloud_queue_config: CloudQueueConfig,
-    ) {
+    async fn run_event_loop(ctx: EventLoopContext) {
+        let EventLoopContext {
+            name,
+            player,
+            group_id,
+            bridge_id,
+            mut session,
+            app_id,
+            queue_store,
+            cloud_queue_config,
+        } = ctx;
         // Track the Sonos service account number for this user (used for queue URIs)
         let mut service_account_number: Option<u32> = None;
 
@@ -165,9 +226,13 @@ impl SonosBridge {
         // Stores (queue_item_id, position_ms) to use when loading cloud queue
         let mut pending_initial_item: Option<(u64, u32)> = None;
 
-        // After a seek/skip, suppress Sonos event reporting briefly to avoid
-        // transient Buffering/Idle states causing UI flicker in Qobuz
-        let mut suppress_sonos_reports_until: Option<tokio::time::Instant> = None;
+        // After commanding Sonos, trust what we commanded until Sonos confirms
+        // it caught up. Prevents transient states from causing UI flicker.
+        let mut commanded: Option<CommandedState> = None;
+
+        // State from previous renderer (received via RestoreState before SetActive)
+        let mut restored_state: Option<PlayingState> = None;
+        let mut restored_position: Option<u32> = None;
 
         // Get Sonos player events for bidirectional sync
         let mut player_events = player.events();
@@ -185,44 +250,63 @@ impl SonosBridge {
                         }
 
                         PlayerEvent::PlaybackChanged(status) => {
+                            let sonos_state = map_sonos_state(status.state);
+
                             // Query fresh position from Sonos (event position may be stale)
                             let fresh_position = match player.get_playback_status(&group_id).await {
                                 Ok(fresh) => fresh.position_millis.unwrap_or(0) as u32,
                                 Err(_) => status.position_millis.unwrap_or(0) as u32,
                             };
 
-                            debug!(
-                                "[{}] Sonos playback changed: {:?} (event: {:?}ms, fresh: {}ms)",
-                                name, status.state, status.position_millis, fresh_position
-                            );
-
-                            // Skip reporting transient states during seek/skip grace period.
-                            // Don't clear grace period early - stale Playing events from the
-                            // old track can arrive before the Buffering transition.
-                            let in_grace = suppress_sonos_reports_until
-                                .is_some_and(|t| tokio::time::Instant::now() < t);
-
-                            if in_grace && !matches!(status.state, PlayState::Playing) {
-                                debug!("[{}] Suppressing transient {:?} during seek/skip", name, status.state);
-                                continue;
-                            }
-
-                            // Map Sonos state to Qobuz state
-                            let qobuz_state = match status.state {
-                                PlayState::Playing => PlayingState::Playing,
-                                PlayState::Paused => PlayingState::Paused,
-                                PlayState::Idle | PlayState::Buffering => PlayingState::Stopped,
+                            // Determine reported state using commanded override
+                            let report_state = match &commanded {
+                                Some(cmd) if cmd.state == sonos_state && cmd.is_confirmable() => {
+                                    // Sonos caught up to commanded state — clear override
+                                    debug!(
+                                        "[{}] Sonos confirmed commanded {:?}, clearing override",
+                                        name, sonos_state
+                                    );
+                                    commanded = None;
+                                    sonos_state
+                                }
+                                Some(cmd) if !cmd.is_expired() => {
+                                    // Sonos hasn't caught up yet — report what we commanded
+                                    debug!(
+                                        "[{}] Overriding Sonos {:?} with commanded {:?}",
+                                        name, sonos_state, cmd.state
+                                    );
+                                    cmd.state
+                                }
+                                Some(cmd) => {
+                                    // Timed out — clear and report Sonos state
+                                    debug!(
+                                        "[{}] Commanded {:?} timed out, reporting Sonos {:?}",
+                                        name, cmd.state, sonos_state
+                                    );
+                                    commanded = None;
+                                    sonos_state
+                                }
+                                None => sonos_state,
                             };
 
-                            // Report to Qobuz immediately with fresh position
+                            let report_position = commanded
+                                .as_ref()
+                                .and_then(|c| c.position_ms)
+                                .unwrap_or(fresh_position);
+
+                            debug!(
+                                "[{}] Sonos playback changed: {:?} -> reporting {:?} @ {}ms",
+                                name, status.state, report_state, report_position
+                            );
+
                             let buffer = match status.state {
                                 PlayState::Buffering => BufferState::Buffering,
                                 _ => BufferState::Ok,
                             };
                             if let Err(e) = session.report_state(build_renderer_state(
-                                qobuz_state,
+                                report_state,
                                 buffer,
-                                fresh_position,
+                                report_position,
                                 current_duration_ms,
                                 current_queue_item_id,
                                 None,
@@ -235,56 +319,63 @@ impl SonosBridge {
                             debug!("[{}] Sonos metadata changed: track={:?}", name, metadata.track_name());
 
                             // Extract track_id from current item's MusicObjectId
-                            if let Some(current_item) = &metadata.current_item {
-                                if let Some(track) = &current_item.track {
-                                    // Update duration
-                                    current_duration_ms = track.duration_millis.map(|d| d as u32);
+                            if let Some(current_item) = &metadata.current_item
+                                && let Some(track) = &current_item.track
+                            {
+                                // Update duration
+                                current_duration_ms = track.duration_millis.map(|d| d as u32);
 
-                                    if let Some(id) = &track.id {
-                                        if let Some(track_id) = extract_track_id(&id.object_id) {
-                                            // Check if track changed
-                                            let track_changed = current_track_id != Some(track_id);
-                                            current_track_id = Some(track_id);
+                                if let Some(id) = &track.id
+                                    && let Some(track_id) = extract_track_id(&id.object_id)
+                                {
+                                    // Check if track changed
+                                    let track_changed = current_track_id != Some(track_id);
+                                    current_track_id = Some(track_id);
 
-                                            // Look up queue_item_id from our queue state
-                                            let new_queue_item_id =
-                                                find_queue_item_id(&queue_store, &bridge_id, track_id).await;
+                                    // Look up queue_item_id from our queue state
+                                    let new_queue_item_id =
+                                        find_queue_item_id(&queue_store, &bridge_id, track_id).await;
 
-                                            if track_changed || current_queue_item_id != new_queue_item_id {
-                                                info!(
-                                                    "[{}] Track changed: queue_item {:?} -> {:?}",
-                                                    name, current_queue_item_id, new_queue_item_id
-                                                );
-                                                current_queue_item_id = new_queue_item_id;
+                                    if track_changed || current_queue_item_id != new_queue_item_id {
+                                        info!(
+                                            "[{}] Track changed: queue_item {:?} -> {:?}",
+                                            name, current_queue_item_id, new_queue_item_id
+                                        );
+                                        current_queue_item_id = new_queue_item_id;
 
-                                                // Get fresh position from Sonos
-                                                if let Ok(status) = player.get_playback_status(&group_id).await {
-                                                    let fresh_position = status.position_millis.unwrap_or(0) as u32;
+                                        // Get fresh position from Sonos
+                                        if let Ok(status) = player.get_playback_status(&group_id).await {
+                                            let sonos_state = map_sonos_state(status.state);
+                                            let fresh_position = status.position_millis.unwrap_or(0) as u32;
 
-                                                    let in_grace = suppress_sonos_reports_until
-                                                        .is_some_and(|t| tokio::time::Instant::now() < t);
-
-                                                    let state = if in_grace && !matches!(status.state, PlayState::Playing) {
-                                                        PlayingState::Playing
-                                                    } else {
-                                                        match status.state {
-                                                            PlayState::Playing => PlayingState::Playing,
-                                                            PlayState::Paused => PlayingState::Paused,
-                                                            PlayState::Idle | PlayState::Buffering => PlayingState::Stopped,
-                                                        }
-                                                    };
-
-                                                    if let Err(e) = session.report_state(build_renderer_state(
-                                                        state,
-                                                        BufferState::Ok,
-                                                        fresh_position,
-                                                        current_duration_ms,
-                                                        current_queue_item_id,
-                                                        None,
-                                                    )).await {
-                                                        warn!("[{}] Failed to report track change to Qobuz: {}", name, e);
-                                                    }
+                                            // Apply commanded state override
+                                            let report_state = match &commanded {
+                                                Some(cmd) if cmd.state == sonos_state && cmd.is_confirmable() => {
+                                                    commanded = None;
+                                                    sonos_state
                                                 }
+                                                Some(cmd) if !cmd.is_expired() => cmd.state,
+                                                Some(_) => {
+                                                    commanded = None;
+                                                    sonos_state
+                                                }
+                                                None => sonos_state,
+                                            };
+
+                                            let report_position = commanded
+                                                .as_ref()
+                                                .and_then(|c| c.position_ms)
+                                                .unwrap_or(fresh_position);
+
+                                            if let Err(e) = session.report_state(build_renderer_state(
+                                                report_state,
+                                                BufferState::Ok,
+                                                report_position,
+                                                current_duration_ms,
+                                                current_queue_item_id,
+                                                None,
+                                            )).await {
+                                                warn!("[{}] Failed to report track change to Qobuz: {}", name, e);
                                             }
                                         }
                                     }
@@ -330,34 +421,26 @@ impl SonosBridge {
 
                         // If this is the initial SetState (before cloud queue loaded) and contains
                         // current_queue_item, store it for use when loading the cloud queue
-                        if session_id.is_none() {
-                            if let Some(ref item) = cmd.current_queue_item {
-                                if let Some(queue_item_id) = item.queue_item_id {
-                                    let position = cmd.current_position.unwrap_or(0);
-                                    debug!(
-                                        "[{}] Storing initial state: queue_item={}, position={}ms",
-                                        name, queue_item_id, position
-                                    );
-                                    pending_initial_item = Some((queue_item_id, position));
-                                }
-                            }
+                        if session_id.is_none()
+                            && let Some(ref item) = cmd.current_queue_item
+                        {
+                            let queue_item_id = item.queue_item_id;
+                            let position = cmd.current_position.unwrap_or(0);
+                            debug!(
+                                "[{}] Storing initial state: queue_item={}, position={}ms",
+                                name, queue_item_id, position
+                            );
+                            pending_initial_item = Some((queue_item_id, position));
                         }
 
                         // Check if Qobuz is requesting a track change
                         let new_queue_item = cmd.current_queue_item.as_ref()
-                            .and_then(|item| item.queue_item_id)
-                            .map(|id| id as i32);
+                            .map(|item| item.queue_item_id as i32);
 
                         let did_seek = cmd.current_position.is_some()
                             && (new_queue_item.is_none() || new_queue_item == current_queue_item_id);
                         let did_skip = new_queue_item.is_some()
                             && new_queue_item != current_queue_item_id;
-
-                        if did_seek || did_skip {
-                            suppress_sonos_reports_until = Some(
-                                tokio::time::Instant::now() + std::time::Duration::from_secs(2)
-                            );
-                        }
 
                         // On skip, save old id for direction lookup, then update
                         let pre_skip_queue_item_id = current_queue_item_id;
@@ -366,32 +449,19 @@ impl SonosBridge {
                             current_duration_ms = None;
                         }
 
-                        // Respond to Qobuz FIRST to minimize UI latency, then
-                        // forward the command to Sonos afterward
-                        let (sonos_state, report_position) = if did_seek || did_skip {
-                            (cmd.state().unwrap_or(PlayingState::Playing), cmd.current_position.unwrap_or(0))
-                        } else {
-                            match player.get_playback_status(&group_id).await {
-                                Ok(status) => {
-                                    let fresh_position = status.position_millis.unwrap_or(0) as u32;
-                                    let state = match status.state {
-                                        PlayState::Playing => PlayingState::Playing,
-                                        PlayState::Paused => PlayingState::Paused,
-                                        PlayState::Idle | PlayState::Buffering => {
-                                            PlayingState::Stopped
-                                        }
-                                    };
-                                    (state, fresh_position)
-                                }
-                                Err(e) => {
-                                    warn!("[{}] Failed to get playback status: {}", name, e);
-                                    (cmd.state().unwrap_or(PlayingState::Stopped), 0)
-                                }
-                            }
+                        // Always respond with the commanded state — Sonos state is
+                        // stale pre-command. Position is fine to query from Sonos
+                        // when the command doesn't include one (plain play/pause).
+                        let report_state = cmd.state().unwrap_or(PlayingState::Playing);
+                        let report_position = match cmd.current_position {
+                            Some(pos) => pos,
+                            None => player.get_playback_status(&group_id).await
+                                .map(|s| s.position_millis.unwrap_or(0) as u32)
+                                .unwrap_or(0),
                         };
 
                         respond.send(build_renderer_state(
-                            sonos_state,
+                            report_state,
                             BufferState::Ok,
                             report_position,
                             current_duration_ms,
@@ -441,15 +511,26 @@ impl SonosBridge {
                                     }
                                 }
 
-                                if did_seek {
-                                    if let Some(position) = cmd.current_position {
-                                        info!("[{}] Seek to {}ms", name, position);
-                                        if let Err(e) = player.seek(&group_id, position).await {
-                                            warn!("[{}] Failed to seek: {}", name, e);
-                                        }
+                                if did_seek
+                                    && let Some(position) = cmd.current_position
+                                {
+                                    info!("[{}] Seek to {}ms", name, position);
+                                    if let Err(e) = player.seek(&group_id, position).await {
+                                        warn!("[{}] Failed to seek: {}", name, e);
                                     }
                                 }
                             }
+
+                            // Set commanded state override so we report the target
+                            // state until Sonos confirms it caught up
+                            commanded = Some(CommandedState::new(
+                                report_state,
+                                cmd.current_position,
+                            ));
+                            debug!(
+                                "[{}] Set commanded state: {:?} position={:?}",
+                                name, report_state, cmd.current_position
+                            );
                         }
                     }
 
@@ -465,35 +546,42 @@ impl SonosBridge {
                             }
                         };
 
-                        let (state, position) = match player.get_playback_status(&group_id).await {
-                            Ok(status) => {
-                                let fresh_position = status.position_millis.unwrap_or(0) as u32;
-                                let state = match status.state {
-                                    PlayState::Playing => PlayingState::Playing,
-                                    PlayState::Paused => PlayingState::Paused,
-                                    PlayState::Idle | PlayState::Buffering => PlayingState::Stopped,
-                                };
-                                (state, fresh_position)
-                            }
-                            Err(e) => {
-                                warn!("[{}] Failed to get playback status: {}", name, e);
-                                (PlayingState::Stopped, 0)
+                        // Use restored state from previous renderer if available,
+                        // otherwise fall back to Sonos's actual state
+                        let (state, position) = if let Some(rs) = restored_state.take() {
+                            let pos = restored_position.take().unwrap_or(0);
+                            info!("[{}] Using restored state: {:?} position={}ms", name, rs, pos);
+                            (rs, pos)
+                        } else {
+                            match player.get_playback_status(&group_id).await {
+                                Ok(status) => {
+                                    let fresh_position = status.position_millis.unwrap_or(0) as u32;
+                                    let state = match status.state {
+                                        PlayState::Playing => PlayingState::Playing,
+                                        PlayState::Paused => PlayingState::Paused,
+                                        PlayState::Idle | PlayState::Buffering => PlayingState::Stopped,
+                                    };
+                                    (state, fresh_position)
+                                }
+                                Err(e) => {
+                                    warn!("[{}] Failed to get playback status: {}", name, e);
+                                    (PlayingState::Stopped, 0)
+                                }
                             }
                         };
 
                         // Get initial metadata to track current item
-                        if let Ok(metadata) = player.get_metadata(&group_id).await {
-                            if let Some(current_item) = &metadata.current_item {
-                                if let Some(track) = &current_item.track {
-                                    current_duration_ms = track.duration_millis.map(|d| d as u32);
-                                    if let Some(id) = &track.id {
-                                        if let Some(tid) = extract_track_id(&id.object_id) {
-                                            current_track_id = Some(tid);
-                                            current_queue_item_id =
-                                                find_queue_item_id(&queue_store, &bridge_id, tid).await;
-                                        }
-                                    }
-                                }
+                        if let Ok(metadata) = player.get_metadata(&group_id).await
+                            && let Some(current_item) = &metadata.current_item
+                            && let Some(track) = &current_item.track
+                        {
+                            current_duration_ms = track.duration_millis.map(|d| d as u32);
+                            if let Some(id) = &track.id
+                                && let Some(tid) = extract_track_id(&id.object_id)
+                            {
+                                current_track_id = Some(tid);
+                                current_queue_item_id =
+                                    find_queue_item_id(&queue_store, &bridge_id, tid).await;
                             }
                         }
 
@@ -534,19 +622,36 @@ impl SonosBridge {
                     Command::Heartbeat { respond } => {
                         match player.get_playback_status(&group_id).await {
                             Ok(status) => {
+                                let sonos_state = map_sonos_state(status.state);
                                 let fresh_position = status.position_millis.unwrap_or(0) as u32;
 
-                                let state = match status.state {
-                                    PlayState::Playing => PlayingState::Playing,
-                                    PlayState::Paused => PlayingState::Paused,
-                                    PlayState::Idle | PlayState::Buffering => PlayingState::Stopped,
+                                // Apply commanded state override
+                                let report_state = match &commanded {
+                                    Some(cmd) if cmd.state == sonos_state && cmd.is_confirmable() => {
+                                        commanded = None;
+                                        sonos_state
+                                    }
+                                    Some(cmd) if !cmd.is_expired() => cmd.state,
+                                    Some(_) => {
+                                        commanded = None;
+                                        sonos_state
+                                    }
+                                    None => sonos_state,
                                 };
 
-                                debug!("[{}] Heartbeat: {:?} @ {}ms", name, state, fresh_position);
+                                let report_position = commanded
+                                    .as_ref()
+                                    .and_then(|c| c.position_ms)
+                                    .unwrap_or(fresh_position);
+
+                                debug!(
+                                    "[{}] Heartbeat: sonos={:?} reporting={:?} @ {}ms",
+                                    name, sonos_state, report_state, report_position
+                                );
                                 respond.send(Some(build_renderer_state(
-                                    state,
+                                    report_state,
                                     BufferState::Ok,
-                                    fresh_position,
+                                    report_position,
                                     current_duration_ms,
                                     current_queue_item_id,
                                     None,
@@ -588,7 +693,7 @@ impl SonosBridge {
                         let track_tuples: Vec<(u64, u64)> = queue.tracks
                             .iter()
                             .filter_map(|t| {
-                                Some((t.track_id? as u64, t.queue_item_id?))
+                                Some((t.track_id? as u64, t.queue_item_id))
                             })
                             .collect();
 
@@ -621,7 +726,7 @@ impl SonosBridge {
                                     let track_id = queue
                                         .tracks
                                         .iter()
-                                        .find(|t| t.queue_item_id == Some(queue_item_id))
+                                        .find(|t| t.queue_item_id == queue_item_id)
                                         .and_then(|t| t.track_id)
                                         .map(|id| id as u64)
                                         .unwrap_or_else(|| {
@@ -636,7 +741,7 @@ impl SonosBridge {
                                     // No initial state from SetState, use first track
                                     let first = queue.tracks.first().unwrap();
                                     (
-                                        first.queue_item_id.unwrap_or(0),
+                                        first.queue_item_id,
                                         first.track_id.unwrap_or(0) as u64,
                                         0,
                                     )
@@ -773,11 +878,16 @@ impl SonosBridge {
                             .and_then(|p| p.value);
                         let queue_index = state.state.as_ref()
                             .and_then(|s| s.current_queue_index);
+                        let playing_state = state.state.as_ref()
+                            .and_then(|s| s.playing_state)
+                            .and_then(|s| PlayingState::try_from(s).ok());
                         info!(
-                            "[{}] Restore state: position={:?}ms queue_idx={:?}",
-                            name, position, queue_index
+                            "[{}] Restore state: state={:?} position={:?}ms queue_idx={:?}",
+                            name, playing_state, position, queue_index
                         );
-                        // TODO: Restore playback position on Sonos
+                        // Save for use in SetActive response
+                        restored_state = playing_state;
+                        restored_position = position;
                     }
 
                     Notification::QueueTracksAdded(msg) => {
@@ -796,8 +906,8 @@ impl SonosBridge {
 
                         if let Some(mut state) = queue_store.get(&bridge_id).await {
                             for t in &msg.tracks {
-                                if let (Some(track_id), Some(queue_item_id)) = (t.track_id, t.queue_item_id) {
-                                    state.items.push(cloud_queue_item(track_id as u64, queue_item_id, sn));
+                                if let Some(track_id) = t.track_id {
+                                    state.items.push(cloud_queue_item(track_id as u64, t.queue_item_id, sn));
                                 }
                             }
                             state.version = format!("{}.{}", major, minor);
@@ -827,8 +937,8 @@ impl SonosBridge {
                                 .unwrap_or(0);
 
                             for (i, t) in msg.tracks.iter().enumerate() {
-                                if let (Some(track_id), Some(queue_item_id)) = (t.track_id, t.queue_item_id) {
-                                    state.items.insert(insert_idx + i, cloud_queue_item(track_id as u64, queue_item_id, sn));
+                                if let Some(track_id) = t.track_id {
+                                    state.items.insert(insert_idx + i, cloud_queue_item(track_id as u64, t.queue_item_id, sn));
                                 }
                             }
                             state.version = format!("{}.{}", major, minor);

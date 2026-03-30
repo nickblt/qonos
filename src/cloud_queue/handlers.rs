@@ -92,7 +92,7 @@ pub async fn get_item_window(
 
     match state.store.get(&bridge_id).await {
         Some(queue_state) => {
-            let previous_size = query.previous_window_size.unwrap_or(0);
+            let previous_size = query.previous_window_size.unwrap_or(10);
             let upcoming_size = query.upcoming_window_size.unwrap_or(10);
 
             let (mut items, includes_beginning, includes_end) =
