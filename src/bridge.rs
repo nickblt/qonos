@@ -165,6 +165,10 @@ impl SonosBridge {
         // Stores (queue_item_id, position_ms) to use when loading cloud queue
         let mut pending_initial_item: Option<(u64, u32)> = None;
 
+        // After a seek/skip, suppress Sonos event reporting briefly to avoid
+        // transient Buffering/Idle states causing UI flicker in Qobuz
+        let mut suppress_sonos_reports_until: Option<tokio::time::Instant> = None;
+
         // Get Sonos player events for bidirectional sync
         let mut player_events = player.events();
 
@@ -191,6 +195,17 @@ impl SonosBridge {
                                 "[{}] Sonos playback changed: {:?} (event: {:?}ms, fresh: {}ms)",
                                 name, status.state, status.position_millis, fresh_position
                             );
+
+                            // Skip reporting transient states during seek/skip grace period.
+                            // Don't clear grace period early - stale Playing events from the
+                            // old track can arrive before the Buffering transition.
+                            let in_grace = suppress_sonos_reports_until
+                                .is_some_and(|t| tokio::time::Instant::now() < t);
+
+                            if in_grace && !matches!(status.state, PlayState::Playing) {
+                                debug!("[{}] Suppressing transient {:?} during seek/skip", name, status.state);
+                                continue;
+                            }
 
                             // Map Sonos state to Qobuz state
                             let qobuz_state = match status.state {
@@ -246,10 +261,17 @@ impl SonosBridge {
                                                 if let Ok(status) = player.get_playback_status(&group_id).await {
                                                     let fresh_position = status.position_millis.unwrap_or(0) as u32;
 
-                                                    let state = match status.state {
-                                                        PlayState::Playing => PlayingState::Playing,
-                                                        PlayState::Paused => PlayingState::Paused,
-                                                        PlayState::Idle | PlayState::Buffering => PlayingState::Stopped,
+                                                    let in_grace = suppress_sonos_reports_until
+                                                        .is_some_and(|t| tokio::time::Instant::now() < t);
+
+                                                    let state = if in_grace && !matches!(status.state, PlayState::Playing) {
+                                                        PlayingState::Playing
+                                                    } else {
+                                                        match status.state {
+                                                            PlayState::Playing => PlayingState::Playing,
+                                                            PlayState::Paused => PlayingState::Paused,
+                                                            PlayState::Idle | PlayState::Buffering => PlayingState::Stopped,
+                                                        }
                                                     };
 
                                                     if let Err(e) = session.report_state(build_renderer_state(
@@ -321,32 +343,37 @@ impl SonosBridge {
                             }
                         }
 
-                        // Forward state changes to Sonos (only if cloud queue is loaded)
-                        if session_id.is_some() {
-                            if let Some(state) = cmd.state() {
-                                let result = match state {
-                                    PlayingState::Playing => player.play(&group_id).await,
-                                    PlayingState::Paused => player.pause(&group_id).await,
-                                    PlayingState::Stopped => player.stop(&group_id).await,
-                                    PlayingState::Unknown => Ok(()),
-                                };
-                                if let Err(e) = result {
-                                    warn!("[{}] Failed to send playback command: {}", name, e);
-                                }
-                            }
+                        // Check if Qobuz is requesting a track change
+                        let new_queue_item = cmd.current_queue_item.as_ref()
+                            .and_then(|item| item.queue_item_id)
+                            .map(|id| id as i32);
 
-                            // TODO: Handle seek (current_position)
-                            if cmd.current_position.is_some() {
-                                warn!("[{}] Seek not yet implemented", name);
-                            }
+                        let did_seek = cmd.current_position.is_some()
+                            && (new_queue_item.is_none() || new_queue_item == current_queue_item_id);
+                        let did_skip = new_queue_item.is_some()
+                            && new_queue_item != current_queue_item_id;
+
+                        if did_seek || did_skip {
+                            suppress_sonos_reports_until = Some(
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(2)
+                            );
                         }
 
-                        // Get current state from Sonos for response
-                        let (sonos_state, report_position) =
+                        // On skip, save old id for direction lookup, then update
+                        let pre_skip_queue_item_id = current_queue_item_id;
+                        if did_skip {
+                            current_queue_item_id = new_queue_item;
+                            current_duration_ms = None;
+                        }
+
+                        // Respond to Qobuz FIRST to minimize UI latency, then
+                        // forward the command to Sonos afterward
+                        let (sonos_state, report_position) = if did_seek || did_skip {
+                            (cmd.state().unwrap_or(PlayingState::Playing), cmd.current_position.unwrap_or(0))
+                        } else {
                             match player.get_playback_status(&group_id).await {
                                 Ok(status) => {
                                     let fresh_position = status.position_millis.unwrap_or(0) as u32;
-
                                     let state = match status.state {
                                         PlayState::Playing => PlayingState::Playing,
                                         PlayState::Paused => PlayingState::Paused,
@@ -360,7 +387,8 @@ impl SonosBridge {
                                     warn!("[{}] Failed to get playback status: {}", name, e);
                                     (cmd.state().unwrap_or(PlayingState::Stopped), 0)
                                 }
-                            };
+                            }
+                        };
 
                         respond.send(build_renderer_state(
                             sonos_state,
@@ -370,6 +398,59 @@ impl SonosBridge {
                             current_queue_item_id,
                             None,
                         ));
+
+                        // Now forward the command to Sonos (after responding to Qobuz)
+                        if session_id.is_some() {
+                            if did_skip {
+                                if let (Some(new_id), Some(old_id)) = (new_queue_item, pre_skip_queue_item_id) {
+                                    let direction = queue_store.get(&bridge_id).await
+                                        .and_then(|state| {
+                                            let cur_idx = state.get_item_index(&old_id.to_string())?;
+                                            let new_idx = state.get_item_index(&new_id.to_string())?;
+                                            Some(new_idx.cmp(&cur_idx))
+                                        });
+
+                                    match direction {
+                                        Some(std::cmp::Ordering::Greater) => {
+                                            info!("[{}] Skip next: {} -> {}", name, old_id, new_id);
+                                            if let Err(e) = player.skip_next(&group_id).await {
+                                                warn!("[{}] Failed to skip next: {}", name, e);
+                                            }
+                                        }
+                                        Some(std::cmp::Ordering::Less) => {
+                                            info!("[{}] Skip prev: {} -> {}", name, old_id, new_id);
+                                            if let Err(e) = player.skip_prev(&group_id).await {
+                                                warn!("[{}] Failed to skip prev: {}", name, e);
+                                            }
+                                        }
+                                        _ => {
+                                            warn!("[{}] Track change {} -> {} but couldn't determine direction", name, old_id, new_id);
+                                        }
+                                    }
+                                }
+                            } else {
+                                if let Some(state) = cmd.state() {
+                                    let result = match state {
+                                        PlayingState::Playing => player.play(&group_id).await,
+                                        PlayingState::Paused => player.pause(&group_id).await,
+                                        PlayingState::Stopped => player.stop(&group_id).await,
+                                        PlayingState::Unknown => Ok(()),
+                                    };
+                                    if let Err(e) = result {
+                                        warn!("[{}] Failed to send playback command: {}", name, e);
+                                    }
+                                }
+
+                                if did_seek {
+                                    if let Some(position) = cmd.current_position {
+                                        info!("[{}] Seek to {}ms", name, position);
+                                        if let Err(e) = player.seek(&group_id, position).await {
+                                            warn!("[{}] Failed to seek: {}", name, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     Command::SetActive { cmd: _, respond } => {
@@ -429,6 +510,25 @@ impl SonosBridge {
                                 None,
                             ),
                         });
+                    }
+
+                    Command::SetVolume { cmd, respond } => {
+                        let new_volume = cmd.volume.unwrap_or(0).min(100) as u8;
+                        info!("[{}] Volume command: {}", name, new_volume);
+
+                        match player.set_volume(&group_id, new_volume).await {
+                            Ok(()) => {
+                                respond.send(qonductor::msg::report::VolumeChanged {
+                                    volume: Some(new_volume as u32),
+                                });
+                            }
+                            Err(e) => {
+                                warn!("[{}] Failed to set volume: {}", name, e);
+                                respond.send(qonductor::msg::report::VolumeChanged {
+                                    volume: Some(new_volume as u32),
+                                });
+                            }
+                        }
                     }
 
                     Command::Heartbeat { respond } => {
