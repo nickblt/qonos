@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start qonductor session manager
-    let mut manager = SessionManager::start(HTTP_PORT).await?;
+    let mut manager = SessionManager::start(HTTP_PORT, &app_id).await?;
     info!("qonductor listening on port {}", HTTP_PORT);
 
     // Start cloud queue HTTP server
@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match system.get_coordinator(group).await {
             Some(player) => {
-                let config = DeviceConfig::new(&group.name, &app_id);
+                let config = DeviceConfig::new(&group.name);
                 let device_uuid = config.device_uuid;
 
                 match manager.add_device(config).await {
@@ -201,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             info!("Creating bridge for group: {} ({})", group.name, group.id);
 
                             if let Some(player) = system.get_coordinator(group).await {
-                                let config = DeviceConfig::new(&group.name, &app_id);
+                                let config = DeviceConfig::new(&group.name);
                                 let device_uuid = config.device_uuid;
 
                                 match manager.add_device(config).await {
