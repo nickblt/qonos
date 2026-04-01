@@ -506,7 +506,7 @@ impl BridgeState {
         &mut self,
         device_uuid: [u8; 16],
         renderer_id: u64,
-        api_jwt: String,
+        api_jwt: Option<String>,
     ) {
         info!(
             "[{}] Device registered: {:02x?} -> renderer {}",
@@ -514,6 +514,11 @@ impl BridgeState {
             &device_uuid[..4],
             renderer_id
         );
+
+        let Some(api_jwt) = api_jwt else {
+            warn!("[{}] No API JWT provided, cannot create Qobuz client", self.name);
+            return;
+        };
 
         // Create and store Qobuz API client for metadata fetching
         let client = QobuzClient::new(&api_jwt, &self.app_id);
